@@ -1,0 +1,888 @@
+################################################################################
+# ESPHome - Easy Wallbox (eSolutions) BLE Integration
+# Versión: 3.2 — PRODUCCIÓN + bonding nativo ESPHome (KBDISP, on_passkey_request) - CCCD correcto vía esp_ble_gattc_write_char_descr post-MTU
+#
+# ── DIAGNÓSTICO ─────────────────────────────────────────────────────────────────
+#   v2.1/v2.2: el ble_text_sensor intentaba registrar el CCCD ANTES de que
+#   el MTU estuviera negociado (cfg_mtu llega después del service discovery).
+#   v2.3: UUID en little-endian incorrecto → "No se encontro caracteristica"
+#
+#   v2.4: UUID corregido + esperar cfg_mtu + escribir CCCD manualmente.
+#   UUID a9da6040 little-endian correcto (verificado con python uuid.bytes_le):
+#   0x40 0x60 0xda 0xa9 0x23 0x08 0x95 0x49 0x94 0xec 0x9c 0xe4 0x1c 0xa2 0x88 0x33
+################################################################################
+
+substitutions:
+  device_name: easywallbox
+  friendly_name: "Easy Wallbox"
+  wallbox_mac:          "80:34:AA:D5:9A:5D"
+  wallbox_bonding_pin:  "001234"
+  wallbox_pin:          "6523"
+  ble_service_uuid:     "331a36f5-2459-45ea-9d95-6142f0c4b307"
+  ble_char_main:        "a9da6040-0823-4995-94ec-9ce41ca28833"
+
+################################################################################
+# GLOBALS
+################################################################################
+globals:
+  - id: wallbox_auth_sent
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: wallbox_last_status
+    type: uint8_t
+    restore_value: false
+    initial_value: '0xFF'
+  - id: reconnect_count
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: cccd_registered
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: bruteforce_pin
+    type: int
+    restore_value: true   # Guarda el progreso entre reinicios
+    initial_value: '0'
+  - id: bruteforce_running
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: service_pin_found
+    type: int
+    restore_value: true
+    initial_value: '-1'
+  - id: is_bonded
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: tx_buffer
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: wallbox_auth_ok
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+################################################################################
+# HARDWARE
+################################################################################
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: "Easy Wallbox EV Charger — BLE Controller v2.4"
+  on_boot:
+    priority: -200
+    then:
+      - lambda: |-
+          // Configuración BLE security — KBDISP + SC_MITM_BOND + passkey=1234
+          esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_MITM_BOND;
+          esp_ble_io_cap_t iocap = ESP_IO_CAP_KBDISP;
+          uint8_t key_size = 16;
+          uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+          uint8_t rsp_key  = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+          uint32_t passkey = 1234;
+          esp_ble_gap_set_security_param(ESP_BLE_SM_SET_STATIC_PASSKEY, &passkey, sizeof(uint32_t));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(uint8_t));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(uint8_t));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(uint8_t));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(uint8_t));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(uint8_t));
+          ESP_LOGI("wallbox", "BLE security: KBDISP+SC_MITM_BOND passkey=1234");
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+################################################################################
+# SISTEMA
+################################################################################
+logger:
+  level: DEBUG
+  logs:
+    ble_client: INFO
+    text_sensor: WARN
+    esp32_ble_tracker: WARN
+    sensor: INFO
+    api.connection: WARN
+    api: WARN
+
+api:
+  encryption:
+    key: !secret ha_api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name}_fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+################################################################################
+# BLE
+################################################################################
+esp32_ble:
+  io_capability: keyboard_display
+
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 1200ms
+    window: 400ms
+    active: false
+
+ble_client:
+  - mac_address: ${wallbox_mac}
+    id: wallbox_ble
+    auto_connect: true
+
+    on_connect:
+      then:
+        - lambda: |-
+            // Instalar GAP hook ahora que BLE está activo (se reinstala en cada reconexión).
+            struct GapHook {
+              static void handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+                if (event == ESP_GAP_BLE_PASSKEY_REQ_EVT) {
+                  ESP_LOGI("wallbox", "*** PASSKEY_REQ — respondiendo con 1234 ***");
+                  esp_ble_passkey_reply(param->ble_security.ble_req.bd_addr, true, 1234);
+                } else if (event == ESP_GAP_BLE_NC_REQ_EVT) {
+                  ESP_LOGI("wallbox", "*** NC_REQ %lu — aceptando ***",
+                           (unsigned long)param->ble_security.key_notif.passkey);
+                  esp_ble_confirm_reply(param->ble_security.key_notif.bd_addr, true);
+                } else if (event == ESP_GAP_BLE_AUTH_CMPL_EVT) {
+                  if (param->ble_security.auth_cmpl.success) {
+                    ESP_LOGI("wallbox", "*** BONDING EXITOSO ***");
+                  id(is_bonded) = true;
+                  } else {
+                    ESP_LOGE("wallbox", "*** BONDING FALLIDO reason=0x%02X ***",
+                             param->ble_security.auth_cmpl.fail_reason);
+                  }
+                }
+              }
+            };
+            esp_err_t hook_ret = esp_ble_gap_register_callback(GapHook::handler);
+            ESP_LOGI("wallbox", "GAP hook instalado ret=%d", hook_ret);
+
+            id(wallbox_auth_sent) = false;
+            id(cccd_registered) = false;
+            id(reconnect_count) += 1;
+            ESP_LOGI("wallbox", "BLE conectado (sesion #%d)", id(reconnect_count));
+
+
+        - binary_sensor.template.publish:
+            id: wallbox_connected
+            state: true
+        # Si ya bonded: ir directo. Si no: hacer bonding primero.
+        - delay: 3s
+        - if:
+            condition:
+              lambda: 'return !id(is_bonded);'
+            then:
+              - lambda: |-
+                  ESP_LOGI("wallbox", "Sin bond — iniciando bonding keyboard+MITM+passkey=1234");
+                  esp_bd_addr_t bda;
+                  memcpy(bda, id(wallbox_ble).get_remote_bda(), sizeof(esp_bd_addr_t));
+                  esp_err_t ret = esp_ble_set_encryption(bda, ESP_BLE_SEC_ENCRYPT_MITM);
+                  ESP_LOGI("wallbox", "esp_ble_set_encryption ret=%d", ret);
+              - delay: 8s
+            else:
+              - lambda: |-
+                  ESP_LOGI("wallbox", "Ya bonded — procediendo directamente");
+        - lambda: |-
+            uint16_t conn_id  = id(wallbox_ble).get_conn_id();
+            uint16_t gattc_if = id(wallbox_ble).get_gattc_if();
+            esp_bd_addr_t bda2;
+            memcpy(bda2, id(wallbox_ble).get_remote_bda(), sizeof(esp_bd_addr_t));
+            uint8_t notify_val[2] = {0x01, 0x00};
+
+            // Char 0x0017 (a9da6040) — estado binario — Notify
+            esp_err_t r1 = esp_ble_gattc_register_for_notify(gattc_if, bda2, 0x0017);
+            esp_err_t r2 = esp_ble_gattc_write_char_descr(
+              gattc_if, conn_id, 0x0018, sizeof(notify_val), notify_val,
+              ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+            ESP_LOGI("wallbox", "CCCD 0x0017 reg=%d write=%d", r1, r2);
+
+            // Char 0x001A (a73e9a10) — respuestas ASCII — Indicate
+            esp_err_t r3 = esp_ble_gattc_register_for_notify(gattc_if, bda2, 0x001A);
+            uint8_t indicate_val[2] = {0x02, 0x00};
+            esp_err_t r4 = esp_ble_gattc_write_char_descr(
+              gattc_if, conn_id, 0x001B, sizeof(indicate_val), indicate_val,
+              ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+            ESP_LOGI("wallbox", "CCCD 0x001A reg=%d write=%d", r3, r4);
+
+            // Char 0x001D (75A9F022) — WALLBOX_ST — estado del cargador — props=0x3E (Notify+Indicate+Read+Write)
+            esp_err_t r5 = esp_ble_gattc_register_for_notify(gattc_if, bda2, 0x001D);
+            uint8_t both_val[2] = {0x03, 0x00};  // Notify + Indicate
+            esp_err_t r6 = esp_ble_gattc_write_char_descr(
+              gattc_if, conn_id, 0x001E, sizeof(both_val), both_val,
+              ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+            ESP_LOGI("wallbox", "CCCD 0x001D reg=%d write=%d", r5, r6);
+
+            if (r2 == ESP_OK) id(cccd_registered) = true;
+        - lambda: |-
+            ESP_LOGI("wallbox", "Enviando AUTH");
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: !lambda |-
+              std::string cmd = "$BLE,AUTH," + std::string("${wallbox_pin}") + "\n";
+              return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - delay: 1s
+        - lambda: |-
+            id(wallbox_auth_sent) = true;
+            if (id(service_pin_found) >= 0) {
+              ESP_LOGI("wallbox", "PIN servicio conocido: %04d — enviando SERV", id(service_pin_found));
+            } else {
+              ESP_LOGI("wallbox", "PIN servicio desconocido — usa botón Bruteforce SERV PIN");
+            }
+        - if:
+            condition:
+              lambda: 'return id(service_pin_found) >= 0;'
+            then:
+              - ble_client.ble_write:
+                  id: wallbox_ble
+                  service_uuid: ${ble_service_uuid}
+                  characteristic_uuid: ${ble_char_main}
+                  value: !lambda |-
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "$BLE,SERV,%04d\n", id(service_pin_found));
+                    ESP_LOGI("wallbox", "Enviando SERV: %s", buf);
+                    std::string cmd(buf);
+                    return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - lambda: |-
+            ESP_LOGI("wallbox", "AUTH+SERV enviados — esperando estado del Wallbox");
+
+
+    on_disconnect:
+      then:
+        - lambda: |-
+            id(wallbox_auth_sent) = false;
+            id(wallbox_last_status) = 0xFF;
+            id(cccd_registered) = false;
+            ESP_LOGW("wallbox", "BLE desconectado");
+        - binary_sensor.template.publish:
+            id: wallbox_connected
+            state: false
+        - binary_sensor.template.publish:
+            id: wallbox_charging
+            state: false
+        - binary_sensor.template.publish:
+            id: wallbox_car_connected
+            state: false
+        - text_sensor.template.publish:
+            id: wallbox_status_text
+            state: "Desconectado"
+
+################################################################################
+# BINARY SENSORS
+################################################################################
+binary_sensor:
+  - platform: template
+    id: wallbox_connected
+    name: "${friendly_name} Conectado"
+    device_class: connectivity
+    lambda: 'return id(wallbox_ble).connected();'
+
+  - platform: template
+    id: wallbox_charging
+    name: "${friendly_name} Cargando"
+    device_class: battery_charging
+
+  - platform: template
+    id: wallbox_car_connected
+    name: "${friendly_name} Vehículo Enchufado"
+    device_class: plug
+
+################################################################################
+# TEXT SENSORS
+################################################################################
+text_sensor:
+  # Sensor BLE: char 0x0017 con notify. internal:true evita el flood de HA.
+  - platform: ble_client
+    ble_client_id: wallbox_ble
+    id: wallbox_raw_notify
+    name: "${friendly_name} RAW hex"
+    service_uuid: ${ble_service_uuid}
+    characteristic_uuid: ${ble_char_main}
+    notify: true
+    update_interval: never
+    internal: true
+
+
+    on_value:
+      then:
+        - lambda: |-
+            if (x.size() == 0) return;
+
+            std::string hex = "";
+            for (size_t i = 0; i < x.size(); i++) {
+              char buf[4];
+              sprintf(buf, "%02X", (uint8_t)x[i]);
+              hex += buf;
+              if (i < x.size() - 1) hex += "-";
+            }
+            if (x.size() < 2) return;
+
+            uint8_t b0 = (uint8_t)x[0];
+            uint8_t b1 = (uint8_t)x[1];
+            uint8_t b2 = (x.size() > 2) ? (uint8_t)x[2] : 0x00;
+
+            // Ignorar ACKs del BGX13P: 01-01-00 y variantes
+            if (b0 == 0x01 && b1 == 0x01 && b2 == 0x00) return;
+            bool all_ack = true;
+            for (size_t i = 0; i < x.size(); i++) {
+              if ((uint8_t)x[i] != 0x01) { all_ack = false; break; }
+            }
+            if (all_ack) return;
+
+            // Log solo de mensajes que no son ACKs
+            ESP_LOGI("wallbox", "Notif RAW: [%s] (%d bytes)", hex.c_str(), x.size());
+
+            // 01-02-00 = SERV FAIL binario (PIN incorrecto)
+            // 01-01-00 = SERV OK binario (PIN correcto) — ya filtrado arriba como ACK normal
+            // La detección ASCII es más fiable y está en wallbox_ascii_notify
+            if (b0 == 0x01 && b1 == 0x02 && b2 == 0x00) {
+              // SERV FAIL — bruteforce continúa
+              return;
+            }
+
+            if (b0 == 0x00) {
+              id(wallbox_last_status) = b1;
+              ESP_LOGI("wallbox", "*** ESTADO: b1=0x%02X b2=0x%02X [%s] ***",
+                       b1, b2, hex.c_str());
+              switch (b1) {
+                case 0xFF:
+                case 0xFB:
+                  id(wallbox_car_connected).publish_state(false);
+                  id(wallbox_charging).publish_state(false);
+                  if (!id(wallbox_auth_ok)) {
+                    id(wallbox_auth_ok) = true;
+                    ESP_LOGI("wallbox", "Auth implícito OK (estado 0x%02X recibido)", b1);
+                  }
+                  id(wallbox_status_text).publish_state("Libre");
+                  break;
+                case 0x01:
+                  id(wallbox_car_connected).publish_state(true);
+                  id(wallbox_charging).publish_state(false);
+                  id(wallbox_status_text).publish_state("Vehículo conectado");
+                  break;
+                case 0x02:
+                  id(wallbox_car_connected).publish_state(true);
+                  id(wallbox_charging).publish_state(false);
+                  id(wallbox_status_text).publish_state("Listo para cargar");
+                  break;
+                case 0x03:
+                  id(wallbox_car_connected).publish_state(true);
+                  id(wallbox_charging).publish_state(true);
+                  id(wallbox_status_text).publish_state("Cargando");
+                  break;
+                case 0x04:
+                  id(wallbox_car_connected).publish_state(true);
+                  id(wallbox_charging).publish_state(true);
+                  id(wallbox_status_text).publish_state("Cargando (ventilación)");
+                  break;
+                case 0x05:
+                  id(wallbox_car_connected).publish_state(false);
+                  id(wallbox_charging).publish_state(false);
+                  id(wallbox_status_text).publish_state("Error");
+                  break;
+                default: {
+                  char buf[48];
+                  sprintf(buf, "Desconocido: %s", hex.c_str());
+                  id(wallbox_status_text).publish_state(buf);
+                  ESP_LOGW("wallbox", "Estado no mapeado: [%s]", hex.c_str());
+                  break;
+                }
+              }
+            } else {
+              char buf[64];
+              sprintf(buf, "MSG: %s", hex.c_str());
+              id(wallbox_status_text).publish_state(buf);
+              ESP_LOGW("wallbox", "b0=0x%02X desconocido: [%s]", b0, hex.c_str());
+            }
+
+  # Sensor ASCII: char 0x001A — respuestas texto ($BLE,AUTH,OK, $DATA,READ,SV, etc.)
+  - platform: ble_client
+    ble_client_id: wallbox_ble
+    id: wallbox_ascii_notify
+    name: "${friendly_name} ASCII Response"
+    service_uuid: ${ble_service_uuid}
+    characteristic_uuid: "a73e9a10-628f-4494-a099-12efaf72258f"
+    notify: true
+    update_interval: never
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            if (x.empty()) return;
+            id(tx_buffer) += x;
+            size_t nl = id(tx_buffer).find('\n');
+            while (nl != std::string::npos) {
+              std::string line = id(tx_buffer).substr(0, nl);
+              id(tx_buffer) = id(tx_buffer).substr(nl + 1);
+              if (line.empty()) { nl = id(tx_buffer).find('\n'); continue; }
+              ESP_LOGI("wallbox", "ASCII RX: %s", line.c_str());
+              if (line.find("$BLE,AUTH,OK") != std::string::npos) {
+                ESP_LOGI("wallbox", "AUTH OK");
+                id(wallbox_auth_ok) = true;
+              } else if (line.find("$BLE,AUTH,FAIL") != std::string::npos) {
+                ESP_LOGE("wallbox", "AUTH FAIL");
+                id(wallbox_auth_ok) = false;
+              } else if (line.find("$BLE,SERV,OK") != std::string::npos) {
+                // *** BRUTEFORCE: PIN DE SERVICIO ENCONTRADO ***
+                int found = id(bruteforce_pin) - 1;
+                if (found < 0) found = 0;
+                ESP_LOGI("wallbox", "*** SERV PIN ENCONTRADO: %04d ***", found);
+                id(service_pin_found) = found;
+                id(bruteforce_running) = false;
+              } else if (line.find("$BLE,SERV,FAIL") != std::string::npos) {
+                // PIN incorrecto — bruteforce continúa normalmente
+              } else if (line.find("$CMD,CHARGE,START,OK") != std::string::npos) {
+                id(wallbox_charging).publish_state(true);
+                id(wallbox_status_text).publish_state("Cargando");
+              } else if (line.find("$CMD,CHARGE,STOP,OK") != std::string::npos) {
+                id(wallbox_charging).publish_state(false);
+                id(wallbox_status_text).publish_state("Listo para cargar");
+              } else if (line.find("$DATA,READ,SV") != std::string::npos) {
+                char buf[256]; strncpy(buf, line.c_str(), 255); buf[255]=0;
+                char *parts[12]; int i=0;
+                char *tok = strtok(buf, ",");
+                while (tok && i<12) { parts[i++]=tok; tok=strtok(nullptr,","); }
+                if (i >= 9) {
+                  float current = atof(parts[4]) / 10.0f;
+                  float voltage = atof(parts[8]) / 10.0f;
+                  float power_kw = (current * voltage) / 1000.0f;
+                  id(wallbox_current_sensor).publish_state(current);
+                  id(wallbox_voltage_sensor).publish_state(voltage);
+                  id(wallbox_power_sensor).publish_state(power_kw);
+                  ESP_LOGI("wallbox", "U:%.1fV I:%.1fA P:%.2fkW", voltage, current, power_kw);
+                }
+              } else if (line.find("$DATA,READ,AD") != std::string::npos) {
+                char buf[256]; strncpy(buf, line.c_str(), 255); buf[255]=0;
+                char *parts[30]; int i=0;
+                char *tok = strtok(buf, ",");
+                while (tok && i<30) { parts[i++]=tok; tok=strtok(nullptr,","); }
+                if (i >= 7) {
+                  float energy_kwh = atof(parts[6]) / 1000.0f;
+                  id(wallbox_energy_sensor).publish_state(energy_kwh);
+                  ESP_LOGI("wallbox", "Energia: %.3f kWh", energy_kwh);
+                }
+              } else if (line.find("$EEP,READ,IDX") != std::string::npos) {
+                char buf[256]; strncpy(buf, line.c_str(), 255); buf[255]=0;
+                char *parts[8]; int n=0;
+                char *tok = strtok(buf, ",");
+                while (tok && n<8) { parts[n++]=tok; tok=strtok(nullptr,","); }
+                if (n >= 5) {
+                  int idx = atoi(parts[3]);
+                  float amps = atof(parts[4]) / 10.0f;
+                  if (idx == 174) {
+                    id(wallbox_user_limit_sensor).publish_state(amps);
+                    ESP_LOGI("wallbox", "Limite: %.0fA", amps);
+                  }
+                }
+              }
+              id(wallbox_last_response).publish_state(line);
+              nl = id(tx_buffer).find('\n');
+            }
+
+  - platform: template
+    id: wallbox_last_response
+    name: "${friendly_name} Última Respuesta ASCII"
+    update_interval: never
+    entity_category: diagnostic
+    icon: "mdi:message-text"
+
+  - platform: template
+    id: wallbox_status_text
+    name: "${friendly_name} Estado"
+    update_interval: never
+    icon: "mdi:ev-station"
+
+################################################################################
+# SENSORES NUMÉRICOS
+################################################################################
+sensor:
+  - platform: template
+    id: wallbox_voltage_sensor
+    name: "${friendly_name} Voltaje"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    icon: "mdi:lightning-bolt"
+
+  - platform: template
+    id: wallbox_current_sensor
+    name: "${friendly_name} Corriente"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    icon: "mdi:current-ac"
+
+  - platform: template
+    id: wallbox_power_sensor
+    name: "${friendly_name} Potencia"
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+    icon: "mdi:flash"
+
+  - platform: template
+    id: wallbox_energy_sensor
+    name: "${friendly_name} Energía Sesión"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    update_interval: never
+    icon: "mdi:battery-charging"
+
+  - platform: template
+    id: wallbox_user_limit_sensor
+    name: "${friendly_name} Límite Configurado"
+    unit_of_measurement: "A"
+    icon: "mdi:current-ac"
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: wallbox_reconnect_sensor
+    name: "${friendly_name} Reconexiones"
+    icon: "mdi:counter"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: 'return (float)id(reconnect_count);'
+    entity_category: diagnostic
+
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi RSSI"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  # ble_rssi eliminado — requiere esp32_ble_tracker activo
+
+################################################################################
+# POLLING PERIÓDICO (cada 30s) — voltaje, corriente, potencia, energía, límite
+################################################################################
+interval:
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(wallbox_ble).connected() && id(wallbox_auth_ok);'
+          then:
+            - lambda: 'ESP_LOGI("wallbox", "Polling 30s activo");'
+            - ble_client.ble_write:
+                id: wallbox_ble
+                service_uuid: ${ble_service_uuid}
+                characteristic_uuid: ${ble_char_main}
+                value: [0x24,0x45,0x45,0x50,0x2C,0x52,0x45,0x41,0x44,0x2C,0x49,0x44,0x58,0x2C,0x31,0x37,0x34,0x0A]
+            - delay: 2s
+            - ble_client.ble_write:
+                id: wallbox_ble
+                service_uuid: ${ble_service_uuid}
+                characteristic_uuid: ${ble_char_main}
+                value: [0x24,0x44,0x41,0x54,0x41,0x2C,0x52,0x45,0x41,0x44,0x2C,0x53,0x56,0x0A]
+            - delay: 2s
+            - ble_client.ble_write:
+                id: wallbox_ble
+                service_uuid: ${ble_service_uuid}
+                characteristic_uuid: ${ble_char_main}
+                value: [0x24,0x44,0x41,0x54,0x41,0x2C,0x52,0x45,0x41,0x44,0x2C,0x41,0x44,0x0A]
+
+################################################################################
+# BOTONES DE CONTROL
+################################################################################
+button:
+  - platform: template
+    name: "${friendly_name} Iniciar Carga"
+    icon: "mdi:play-circle"
+    on_press:
+      then:
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: !lambda |-
+              std::string cmd = "$CMD,CHARGE,START,0\n";
+              ESP_LOGI("wallbox", "CMD: %s", cmd.c_str());
+              return std::vector<uint8_t>(cmd.begin(), cmd.end());
+
+  - platform: template
+    name: "${friendly_name} Detener Carga"
+    icon: "mdi:stop-circle"
+    on_press:
+      then:
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: !lambda |-
+              std::string cmd = "$CMD,CHARGE,STOP,0\n";
+              ESP_LOGI("wallbox", "CMD: %s", cmd.c_str());
+              return std::vector<uint8_t>(cmd.begin(), cmd.end());
+
+  - platform: template
+    name: "${friendly_name} Límite 6A"
+    icon: "mdi:speedometer-slow"
+    entity_category: config
+    on_press:
+      then:
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: [0x24,0x45,0x45,0x50,0x2C,0x57,0x52,0x49,0x54,0x45,0x2C,0x49,0x44,0x58,0x2C,0x31,0x37,0x34,0x2C,0x36,0x0A]
+        - sensor.template.publish:
+            id: wallbox_user_limit_sensor
+            state: 6.0
+
+  - platform: template
+    name: "${friendly_name} Límite 10A"
+    icon: "mdi:speedometer-medium"
+    entity_category: config
+    on_press:
+      then:
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: [0x24,0x45,0x45,0x50,0x2C,0x57,0x52,0x49,0x54,0x45,0x2C,0x49,0x44,0x58,0x2C,0x31,0x37,0x34,0x2C,0x31,0x30,0x0A]
+        - sensor.template.publish:
+            id: wallbox_user_limit_sensor
+            state: 10.0
+
+  - platform: template
+    name: "${friendly_name} Límite 16A"
+    icon: "mdi:speedometer"
+    entity_category: config
+    on_press:
+      then:
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: [0x24,0x45,0x45,0x50,0x2C,0x57,0x52,0x49,0x54,0x45,0x2C,0x49,0x44,0x58,0x2C,0x31,0x37,0x34,0x2C,0x31,0x36,0x0A]
+        - sensor.template.publish:
+            id: wallbox_user_limit_sensor
+            state: 16.0
+
+  - platform: template
+    name: "${friendly_name} Límite 32A"
+    icon: "mdi:speedometer-fast"
+    entity_category: config
+    on_press:
+      then:
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: [0x24,0x45,0x45,0x50,0x2C,0x57,0x52,0x49,0x54,0x45,0x2C,0x49,0x44,0x58,0x2C,0x31,0x37,0x34,0x2C,0x33,0x32,0x0A]
+        - sensor.template.publish:
+            id: wallbox_user_limit_sensor
+            state: 32.0
+
+  - platform: template
+    name: "${friendly_name} Reautenticar"
+    icon: "mdi:key-wireless"
+    entity_category: config
+    on_press:
+      then:
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: !lambda |-
+              std::string cmd = "$BLE,AUTH," + std::string("${wallbox_pin}") + "\n";
+              ESP_LOGI("wallbox", "Re-enviando AUTH manual");
+              return std::vector<uint8_t>(cmd.begin(), cmd.end());
+
+  - platform: template
+    name: "${friendly_name} Reconectar BLE"
+    icon: "mdi:bluetooth-connect"
+    entity_category: config
+    on_press:
+      then:
+        - ble_client.disconnect:
+            id: wallbox_ble
+        - delay: 3s
+        - ble_client.connect:
+            id: wallbox_ble
+
+  - platform: template
+    name: "${friendly_name} Borrar Bonds BGX13P"
+    icon: "mdi:bluetooth-off"
+    entity_category: config
+    on_press:
+      then:
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: !lambda |-
+              std::string cmd = "$BLE,AUTH," + std::string("${wallbox_pin}") + "\n";
+              ESP_LOGI("wallbox", "Auth antes de borrar bonds");
+              return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - delay: 2s
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: !lambda |-
+              std::string cmd = "$BLE,DEL,ALL\n";
+              ESP_LOGI("wallbox", "Enviando BLE,DEL,ALL");
+              return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - delay: 1s
+        - lambda: |-
+            id(is_bonded) = false;
+            ESP_LOGI("wallbox", "Borrando bond y reconectando...");
+        - ble_client.remove_bond:
+            id: wallbox_ble
+        - delay: 2s
+        - ble_client.disconnect:
+            id: wallbox_ble
+        - delay: 3s
+        - ble_client.connect:
+            id: wallbox_ble
+
+  - platform: template
+    name: "${friendly_name} Bruteforce SERV PIN"
+    icon: "mdi:lock-search"
+    entity_category: diagnostic
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(wallbox_ble).connected()) {
+              ESP_LOGW("wallbox", "No conectado — no se puede iniciar bruteforce");
+              return;
+            }
+            ESP_LOGI("wallbox", "Iniciando bruteforce SERV PIN desde %04d", id(bruteforce_pin));
+            id(bruteforce_running) = true;
+        # Loop: envía $BLE,AUTH luego $BLE,SERV,NNNN, espera respuesta, incrementa
+        # Ejecutamos en bloques de 10 para no bloquear el watchdog
+        - while:
+            condition:
+              lambda: 'return id(bruteforce_running) && id(wallbox_ble).connected() && id(bruteforce_pin) <= 9999;'
+            then:
+              - ble_client.ble_write:
+                  id: wallbox_ble
+                  service_uuid: ${ble_service_uuid}
+                  characteristic_uuid: ${ble_char_main}
+                  value: !lambda |-
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "$BLE,SERV,%04d\n", id(bruteforce_pin));
+                    int current_pin = id(bruteforce_pin);
+                    id(bruteforce_pin)++;
+                    if (current_pin % 500 == 0)
+                      ESP_LOGI("wallbox", "Bruteforce progreso: %04d/9999 (%.1f%%)",
+                               current_pin, current_pin / 99.99f);
+                    std::string cmd(buf);
+                    return std::vector<uint8_t>(cmd.begin(), cmd.end());
+              - delay: 200ms  # Tiempo para recibir respuesta ASCII
+              - if:
+                  condition:
+                    lambda: 'return (id(bruteforce_pin) % 100) == 0;'
+                  then:
+                    - delay: 500ms  # Pausa para watchdog/scanner
+
+  - platform: template
+    name: "${friendly_name} Reset Bruteforce"
+    icon: "mdi:restart"
+    entity_category: diagnostic
+    on_press:
+      then:
+        - lambda: |-
+            id(bruteforce_pin) = 0;
+            id(bruteforce_running) = false;
+            id(service_pin_found) = -1;
+            ESP_LOGI("wallbox", "Bruteforce reseteado");
+
+  - platform: template
+    name: "${friendly_name} Diagnóstico PIN BGX13P"
+    icon: "mdi:key-outline"
+    entity_category: diagnostic
+    on_press:
+      then:
+        # Consulta el PIN configurado en el BGX13P y el nivel de seguridad
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: !lambda |-
+              std::string cmd = "$BLE,AUTH," + std::string("${wallbox_pin}") + "\n";
+              ESP_LOGI("wallbox", "AUTH para diagnostico");
+              return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - delay: 1s
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: !lambda |-
+              // Consulta el passkey configurado en el BGX13P
+              std::string cmd = "$BLE,GET,PASSKEY\n";
+              ESP_LOGI("wallbox", "Enviando GET PASSKEY");
+              return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - delay: 1s
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: !lambda |-
+              // Consulta el nivel de seguridad BLE del BGX13P
+              std::string cmd = "$BLE,GET,SECLVL\n";
+              ESP_LOGI("wallbox", "Enviando GET SECLVL");
+              return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - delay: 1s
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: !lambda |-
+              // Consulta si el bonding está habilitado
+              std::string cmd = "$BLE,GET,BOND\n";
+              ESP_LOGI("wallbox", "Enviando GET BOND");
+              return std::vector<uint8_t>(cmd.begin(), cmd.end());
+
+################################################################################
+# NÚMERO — Slider de límite personalizado
+################################################################################
+number:
+  - platform: template
+    name: "${friendly_name} Límite de Carga"
+    id: set_user_limit
+    min_value: 6
+    max_value: 32
+    step: 1
+    unit_of_measurement: "A"
+    icon: "mdi:current-ac"
+    optimistic: true
+    restore_value: true
+    initial_value: 16
+    set_action:
+      then:
+        - ble_client.ble_write:
+            id: wallbox_ble
+            service_uuid: ${ble_service_uuid}
+            characteristic_uuid: ${ble_char_main}
+            value: !lambda |-
+              int limit = (int)x;
+              std::string cmd = "$EEP,WRITE,IDX,174," + std::to_string(limit) + "\n";
+              ESP_LOGI("wallbox", "Limite ajustado a %d A", limit);
+              return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - sensor.template.publish:
+            id: wallbox_user_limit_sensor
+            state: !lambda 'return x;'
